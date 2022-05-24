@@ -114,7 +114,7 @@ def create_multigraph_from_snapshot(snapshot_filename):
 	# create a new MultiGraph to unfreeze
 	g = nx.MultiGraph(max(connected_component_subgraphs(g), key=len))
 	print("LN graph created with", g.number_of_nodes(), "nodes,", g.number_of_edges(), "channels.")
-	return g
+	return g, len(channels)
 
 
 def ln_multigraph_to_hop_graph(ln_multigraph):

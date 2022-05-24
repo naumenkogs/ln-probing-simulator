@@ -37,7 +37,7 @@ from hop import Hop, dir0, dir1
 from graph import create_multigraph_from_snapshot, ln_multigraph_to_hop_graph
 
 import networkx as nx
-from random import random, shuffle
+from random import random, shuffle, sample
 
 
 class Prober:
@@ -56,8 +56,9 @@ class Prober:
 		self.our_node_id = node_id
 		# parse snapshot date from filename to include in plot title
 		self.snapshot_date = snapshot_filename[-len("yyyy-mm-dd.json"):-len(".json")]
-		ln_multigraph = create_multigraph_from_snapshot(snapshot_filename)
+		ln_multigraph, n_channels = create_multigraph_from_snapshot(snapshot_filename)
 		self.lnhopgraph = ln_multigraph_to_hop_graph(ln_multigraph)
+		self.n_channels = n_channels
 		for entry_node in entry_nodes:
 			self.open_channel(self.our_node_id, entry_node, entry_channel_capacity)
 		self.local_routing_graph = self.lnhopgraph.to_directed()
@@ -65,7 +66,6 @@ class Prober:
 
 	def __str__(self):
 		return "\n".join([str(self.lnhopgraph[first][second]["hop"]) for first, second in self.lnhopgraph.edges()])
-
 
 	def open_channel(self, first, second, capacity, push_satoshis=0):
 		'''
@@ -121,9 +121,11 @@ class Prober:
 			hop = self.lnhopgraph[n1][n2]["hop"]
 			direction = dir0 if n1 < n2 else dir1
 			if direction == dir0:
-				return hop.can_forward(dir0) and amount <= hop.h_u
+				# return hop.can_forward(dir0) and amount <= hop.h_u
+				return amount <= hop.h_u
 			else:
-				return hop.can_forward(dir1) and amount <= hop.g_u
+				# return hop.can_forward(dir1) and amount <= hop.g_u
+				return amount <= hop.g_u
 		def filter_node(n):
 			'''
 				Return True if the node is kept, False if it is excluded.
@@ -192,6 +194,15 @@ class Prober:
 		node_pairs = [p for p in zip(path, path[1:])]
 		reached_target = False
 		for n1, n2 in node_pairs:
+			# A very rought approximation of failures at nodes unrelated to liquidity (e.g., node
+			# being offline).
+			# For simplicity, this approach has no memory: a node that failed in previous iteration
+			# may be fine in the next iteration.
+			failure = random()
+			FAILURE_RATE = 0.1
+			if failure <= FAILURE_RATE:
+				break
+
 			reached_target = n2 == path[-1]
 			hop = self.lnhopgraph[n1][n2]["hop"]
 			direction = dir0 if n1 < n2 else dir1
@@ -220,7 +231,7 @@ class Prober:
 		target_hop = self.lnhopgraph[target_node_pair[0]][target_node_pair[1]]["hop"]
 		known_failed_amount = {dir0: None, dir1: None}
 		#print("\n----------------------\nProbing hop", target_node_pair)
-		#print(target_hop)
+		print(target_hop)
 		def probe_target_hop_in_direction(direction, jamming):
 			'''
 				Probe the target hop in a given direction, with or without jamming.
@@ -347,6 +358,7 @@ class Prober:
 						pass
 			target_hop.unjam_all()
 		#print("Path failed", total_num_probes_failed, "times.")
+		print(target_hop)
 		return total_num_probes
 
 
@@ -439,4 +451,97 @@ class Prober:
 		print("Share of capacity in 5-channel hops:", share_total_capacity_in_n_hops(all_hops, 5, 5, total_capacity))
 		print("Share of capacity of <= 5-channel hops:", 	share_total_capacity_in_n_hops(all_hops, 1, 5, total_capacity))
 		print("Share of capacity of <= 10-channel hops:", 	share_total_capacity_in_n_hops(all_hops, 1, 10, total_capacity))
+
+	# This function is used to test how efficient is slot jamming. It is called to disable one
+	# of the best channels (presumably, via jamming, but in practice we just flag it).
+	# The choice of top channels happens inside this function.
+	def disable_random_channels(self, target_number):
+		random_ordered_edges = sample(self.lnhopgraph.edges(), k=len(self.lnhopgraph.edges()))
+		total_jammed_amount = 0
+		for (n1, n2) in random_ordered_edges:
+			if n1 == "PROBER" or n2 == "PROBER":
+				continue
+			# Jam % of hops
+			jammed_number, jammed_amount = self.lnhopgraph.get_edge_data(n1, n2)["hop"].jam_random()
+			target_number -= jammed_number
+			total_jammed_amount += jammed_amount
+			# print(target_number)
+			if target_number <= 0:
+				return 0, total_jammed_amount
+		return target_number, total_jammed_amount
+
+	# What makes it a top channel: good place in the topology and throughput.
+	# We will find the largest hops by throughput, and multiply that by the neighrbor
+	# hop total throughput.
+	# Throughput either meaning either:
+	# - number of (large enough) enabled channels for slot-jamming
+	# - or capacity for amount jamming
+	# Consider only non-jammed channels. Always consider both directions for simplicity.
+	def find_top_hops(self, slot_jamming=True):
+		hop_ranks = dict()
+		for (n1, n2) in self.lnhopgraph.edges():
+			current_hop = self.lnhopgraph.get_edge_data(n1, n2)["hop"]
+			current_hop_avail_capacity = current_hop.available_capacity()
+			if current_hop_avail_capacity < 1_000_000:
+				continue
+			if slot_jamming:
+				current_hop_throughput = current_hop.available_dirs()
+			else:
+				current_hop_throughput = current_hop_avail_capacity
+
+			neighbors_avail_throughput = 0
+			for neighbor_edge in list(self.lnhopgraph.edges(n1)) + list(self.lnhopgraph.edges(n2)):
+				if neighbor_edge[0] in [n1, n2] and neighbor_edge[1] in [n1, n2]:
+					continue
+				neighbor_hop = self.lnhopgraph.get_edge_data(neighbor_edge[0], neighbor_edge[1])["hop"]
+				if slot_jamming:
+					neighbors_avail_throughput += neighbor_hop.available_dirs()
+				else:
+					neighbors_avail_throughput += neighbor_hop.available_capacity()
+			hop_ranks[(n1, n2)] = (neighbors_avail_throughput, current_hop_throughput)
+		sorted_hop_ranks = sorted(hop_ranks.items(), key=lambda item: item[1][0]/item[1][1], reverse=True)
+		return sorted_hop_ranks
+
+
+	# This function is used to test how efficient is slot jamming. It is called to disable one
+	# of the best channels (presumably, via jamming, but in practice we just flag it).
+	# The choice of top channels happens inside this function.
+	def disable_hops(self, target_hops, channels_to_jam):
+		i = 0
+		jammed_total_amount = 0
+		while channels_to_jam > 0 and i < len(target_hops):
+			target_hop = target_hops[i]
+			jammed_channels, jammed_amount = self.lnhopgraph.get_edge_data(target_hop[0][0], target_hop[0][1])["hop"].jam_all()
+			channels_to_jam -= jammed_channels
+			jammed_total_amount += jammed_amount
+			i += 1
+		return target_hops[i:], jammed_total_amount
+
+	def count_jammed(self):
+		result1 = 0
+		result2 = 0
+		for (n1, n2) in self.lnhopgraph.edges():
+			current_hop = self.lnhopgraph.get_edge_data(n1, n2)["hop"]
+			result1 += len(set(current_hop.j[0] + current_hop.j[1]))
+			result2 += current_hop.N
+		return (result1, result2)
+
+	# The rebalance-and-jam strategy assumes moving capacity across the node towards one (or a few)
+	# channels, and then jamming those,
+	# This function estimates, for how many hops this would reduce attack cost.
+	def estimate_rebalance_and_jam(self):
+		optimize = 0
+		no_optimize = 0
+		few_channels = 0
+		for node in self.lnhopgraph.nodes():
+			for edge in self.lnhopgraph.edges(node):
+				current_hop = self.lnhopgraph.get_edge_data(edge[0], edge[1])["hop"]
+				rebalance_and_jam = current_hop.rebalance_and_jam_efficiency()
+				if rebalance_and_jam == None:
+					few_channels += 1
+				elif rebalance_and_jam:
+					optimize += 1
+				else:
+					no_optimize += 1
+		return optimize, no_optimize, few_channels
 

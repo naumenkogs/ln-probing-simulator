@@ -279,3 +279,80 @@ def experiment_2(num_target_hops, num_runs_per_experiment):
 
 	print("\n\n**** Experiment 2 complete ****")
 
+
+def measure_success_rate(prober, targets):
+	PAYMENT_AMOUNT = 1_000_000
+	max_paths_suggested = 10
+
+	successes = 0
+	global_attempts = 0
+	for target in targets:
+		paths = prober.paths_for_amount(target, PAYMENT_AMOUNT, max_paths_suggested=max_paths_suggested)
+		attempts = 0
+		while attempts < max_paths_suggested:
+			try:
+				path = next(paths)
+				successes += prober.issue_probe_along_path(path, PAYMENT_AMOUNT)
+			except Exception as e:
+				break
+			attempts += 1
+		global_attempts += attempts
+
+	if global_attempts == 0:
+		print('all tries failed')
+		return 0
+	else:
+		success_rate = round(successes * 1.0 / global_attempts, 2)
+		print('success rate: ', success_rate)
+		return success_rate
+
+# Take 100 hops with 2 channels each, and see if any of the paths can forward a given fixed
+# amount.
+# Then we will do the same, but after jamming some random channels in the network.
+def experiment_3(prober):
+	num_target_hops = 200
+	num_channels = 1
+	targets = prober.choose_target_hops_with_n_channels(num_target_hops, num_channels)
+	jam_channels_step = 5000
+	jammed_channels_total = 0
+	jammed_amount_total = 0
+	results = []
+	for _ in range(20):
+		intermediate_result = (jammed_channels_total, jammed_amount_total, measure_success_rate(prober, targets))
+		results.append(intermediate_result)
+		remaining_targets, jammed_amount = prober.disable_random_channels(jam_channels_step)
+		prober.reset_all_estimates()
+		jammed_channels_total += (jam_channels_step - remaining_targets)
+		jammed_amount_total += jammed_amount
+		print('jammed_channels_total: ', jammed_channels_total)
+		print('jammed_amount_total: ', jammed_amount_total * 1.0 / 100_000_000)
+	print("\n\n**** Experiment 3 complete ****")
+	return results
+
+# Take 100 hops with 2 channels each, and see if any of the paths can forward a given fixed
+# amount. Then we will do the same, but after jamming top hops in the network.
+def experiment_4(prober, top_for_slot_jamming=True):
+	num_target_hops = 100
+	num_channels = 1
+	targets = prober.choose_target_hops_with_n_channels(num_target_hops, num_channels)
+	jam_channels_step = 5000
+	top_hops = prober.find_top_hops(top_for_slot_jamming)
+	print(len(top_hops))
+	jammed_channels_total = 0
+	jammed_amount_total = 0
+	results = []
+	for _ in range(20):
+		intermediate_result = (jammed_channels_total, jammed_amount_total, measure_success_rate(prober, targets))
+		results.append(intermediate_result)
+		if len(top_hops) <= 0:
+			return results
+		top_hops, jammed_amount = prober.disable_hops(top_hops, jam_channels_step)
+		prober.reset_all_estimates()
+		jammed_channels_total += jam_channels_step
+		jammed_amount_total += jammed_amount
+		print('jammed_channels_total: ', jammed_channels_total)
+		print('jammed_amount_total: ', jammed_amount_total * 1.0 / 100_000_000)
+	print("\n\n**** Experiment 4 complete ****")
+	return results
+
+

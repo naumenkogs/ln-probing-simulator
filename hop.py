@@ -36,7 +36,7 @@ from rectangle import ProbingRectangle, Rectangle
 
 from itertools import product
 from math import log2
-from random import randrange
+from random import randint, randrange
 
 # We encode channel direction as a boolean.
 # Direction 0 is from the alphanumerically lower node ID to the higher, direction 1 is the opposite.
@@ -102,6 +102,32 @@ class Hop:
 				num_jams += self.jam(i, direction)
 		return num_jams
 
+	def jam_all(self):
+		jammed_channels = 0
+		jammed_amount = 0
+		for i in range(self.N):
+			jammed = False
+			for dir in [0, 1]:
+				if self.jam(i, dir) > 0:
+					jammed = True
+					# For jam tracking purposes, we assume that every direction is half capacity.
+					jammed_amount += int(self.c[i] / 2)
+			jammed_channels += jammed
+		# print(jammed_channels)
+		return jammed_channels, jammed_amount
+
+	def jam_random(self):
+		random_target_channel = randint(0, self.N - 1)
+		# print('Jamming ', random_target_channel)
+		num_jams = 0
+		jammed_amount = 0
+		for dir in [0, 1]:
+			if self.jam(random_target_channel, dir):
+				num_jams += 1
+				# For jam tracking purposes, we assume that every direction is half capacity.
+				jammed_amount += int(self.c[random_target_channel] / 2)
+		return num_jams > 0, jammed_amount
+
 
 	def unjam(self, channel_index, direction):
 		if channel_index in self.j[direction]:
@@ -141,7 +167,6 @@ class Hop:
 			if points_left == 0:
 				break
 		return points
-	
 
 	def update_dependent_hop_properties(self):
 		'''
@@ -357,7 +382,7 @@ class Hop:
 	def worth_probing_h(self):
 		# is there any uncertainty left about h that we resolve it without jamming?
 		return self.can_forward(dir0) and self.h_u - self.h_l > 1
-	
+
 
 	def worth_probing_g(self):
 		# is there any uncertainty left about g that we resolve it without jamming?
@@ -480,7 +505,12 @@ class Hop:
 			# if we're jamming, we must jam all channels except one
 			assert(len(available_channels) <= 1)
 		def b_in_dir(i, direction):
-			return self.b[i] if direction == dir0 else self.c[i] - self.b[i]
+			# We assume some payment traffic across the channel locked in-flight, so we limit the
+			# available balance in either direction.
+			IN_FLIGHT = 0.5
+			return (int)((self.b[i] if direction == dir0 else self.c[i] - self.b[i]) * IN_FLIGHT)
+		if available_channels == []:
+			return False
 		probe_passed = amount <= max(b_in_dir(i, direction) for i in available_channels)
 		if direction == dir0:
 			# should only update if the amount is between current bounds
@@ -563,3 +593,44 @@ class Hop:
 			self.update_dependent_hop_properties()
 		return probe_passed
 
+	def available_dirs(self):
+		result = 0
+		for i in range(self.N):
+			if i not in self.j[0]:
+				result += 1
+			if i not in self.j[1]:
+				result += 1
+		return result
+
+	def available_capacity(self):
+		result = 0
+		for i in range(self.N):
+			if i not in self.j[0]:
+				result += self.c[i]
+			if i not in self.j[1]:
+				result += self.c[i]
+		return result
+
+	# Returns true if rebalance-and-jam is more efficient, or false if simple slot jamming is more
+	# efficient.
+	def rebalance_and_jam_efficiency(self):
+		if self.N < 3:
+			return None
+		simple_slot_jamming_cost = ((self.N * 34 + 122) / 3) # looping allows divide by 3
+		sorted_capacities = sorted(self.c, reverse=True)
+		channels_after_rebalance = None
+		balance_to_move = None
+		for i in range(1, int(self.N / 2) + 1):
+			top_channels_capacity = sum(sorted_capacities[:i])
+			low_channels_capacity = sum(sorted_capacities[i:])
+			if low_channels_capacity <= top_channels_capacity:
+				channels_after_rebalance = i
+				balance_to_move = low_channels_capacity
+				break
+		if channels_after_rebalance == None:
+			return False
+		base_fee = 1 * (self.N - channels_after_rebalance)
+		percent_fee = 0.01 * balance_to_move
+		optimized_cost = (channels_after_rebalance * 34 + 122) / 3 + base_fee + percent_fee
+		print(optimized_cost, simple_slot_jamming_cost)
+		return optimized_cost < simple_slot_jamming_cost
